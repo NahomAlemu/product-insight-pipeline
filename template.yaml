@@ -1,0 +1,194 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  account-roi-copilot
+
+  A serverless application that fetches SEC data for target accounts,
+  analyzes it with Bedrock to create an ROI brief, and saves/sends the result.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 45
+    MemorySize: 256
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        # We will reference the S3 bucket name in our functions
+        OUTPUT_BUCKET: !Ref OutputBucket
+
+Resources:
+  # =================================================================
+  #  NEW: S3 Bucket to store our output files
+  # =================================================================
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "account-roi-copilot-output-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # =================================================================
+  #  IAM Role for our Lambda Functions
+  # =================================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AccountRoiCopilotLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLogsBasic
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Sid: S3WriteAccess # NEW: Allow writing to our S3 bucket
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${OutputBucket.Arn}/*"
+              - Sid: S3ReadAccess
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${OutputBucket.Arn}/*"
+              - Sid: InvokeBedrockSonnet
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-3-sonnet-20240229-v1:0"
+              - Sid: SendWithSES
+                Effect: Allow
+                Action: ses:SendEmail
+                Resource: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+
+  # =================================================================
+  #  Our Three NEW Lambda Functions
+  # =================================================================
+  FetchEdgarDataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/fetch_edgar_data/ # Rename folder from scrape_website
+      Handler: app.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  BuildFeaturesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/build_features/ # Rename folder from aggregate_data
+      Handler: app.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  GenerateRoiBriefFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/generate_roi_brief/ # Rename folder from analyze_and_notify
+      Handler: app.handler
+      Timeout: 90
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  # =================================================================
+  #  Our UPDATED Step Functions State Machine
+  # =================================================================
+  InsightStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: AccountRoiCopilotPipeline
+      Definition:
+        Comment: "Pipeline to build ROI briefs for target accounts from SEC data."
+        StartAt: MapFetchData
+        States:
+          MapFetchData:
+            Type: Map
+            ItemsPath: "$.accounts" # We now iterate over a list of accounts
+            Parameters:
+              "account.$": "$$.Map.Item.Value"
+              "bedrock.$": "$.bedrock"
+              "ses.$": "$.ses"
+            Iterator:
+              StartAt: FetchEdgarData
+              States:
+                FetchEdgarData:
+                  Type: Task
+                  Resource: "arn:aws:states:::lambda:invoke"
+                  Parameters:
+                    FunctionName: !GetAtt FetchEdgarDataFunction.Arn
+                    Payload:
+                      "account.$": "$.account"
+                  ResultPath: "$.edgar_data"
+                  Next: BuildFeatures
+                BuildFeatures:
+                  Type: Task
+                  Resource: "arn:aws:states:::lambda:invoke"
+                  Parameters:
+                    FunctionName: !GetAtt BuildFeaturesFunction.Arn
+                    Payload:
+                      "cik.$": "$.account.cik"
+                      "name.$": "$.account.name"
+                      "edgar_data.$": "$.edgar_data.Payload" # pass the whole edgar_data object
+                  ResultPath: "$.features"
+                  Next: GenerateRoiBrief
+                GenerateRoiBrief:
+                  Type: Task
+                  Resource: "arn:aws:states:::lambda:invoke"
+                  Parameters:
+                    FunctionName: !GetAtt GenerateRoiBriefFunction.Arn
+                    Payload:
+                      "features.$": "$.features.Payload"
+                      "bedrock.$": "$.bedrock"
+                      "ses.$": "$.ses"
+                  End: true
+            MaxConcurrency: 5
+            ResultPath: "$.results"
+            End: true # The Map state is the entire workflow for all accounts
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref FetchEdgarDataFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref BuildFeaturesFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GenerateRoiBriefFunction
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Name: AccountRoiCopilotDailyTrigger
+            Description: "Daily trigger for the Account ROI Copilot Pipeline"
+            Schedule: "cron(0 13 * * ? *)" # Runs at 13:00 UTC (6 AM PDT) every day
+            Input:
+              Fn::Sub: >-
+                  {
+                    "accounts": [
+                      {"name": "Starbucks", "ticker": "SBUX", "cik": "0000829224"},
+                      {"name": "Zillow", "ticker": "Z", "cik": "0001617640"},
+                      {"name": "Expedia Group", "ticker": "EXPE", "cik": "0001324424"}
+                    ],
+                    "bedrock": {
+                      "region": "us-west-2"
+                    },
+                    "ses": {
+                      "sender": "yourverifiedemail@gmail.com",
+                      "recipient": "yourverifiedeail@gmail.com",
+                      "subject": "Daily Account ROI Briefs"
+                    }
+                  }
+
+Outputs:
+  StateMachineArn:
+    Description: "ARN of the Step Functions State Machine"
+    Value: !Ref InsightStateMachine
+  OutputBucketName:
+    Description: "Name of the S3 bucket for storing output briefs"
+    Value: !Ref OutputBucket
