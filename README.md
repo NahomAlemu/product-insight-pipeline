@@ -23,12 +23,6 @@ A fully serverless AWS pipeline that ingests **public company financial filings*
 - **Automated Distribution**  
   Stores JSON + HTML in S3 and emails the formatted brief via Amazon SES.
 
-### Architecture
-<details>
-  <summary>Click to view Architecture Diagram</summary>
-  <br>
-  <img alt="Architecture Diagram" src="https://github.com/user-attachments/assets/aeb14566-bc97-4e65-ba35-1cc6afac5aeb" >
-</details>
 
 **Core AWS Services**
 - **EventBridge** → daily trigger
